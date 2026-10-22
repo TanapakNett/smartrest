@@ -1,0 +1,755 @@
+#include <Wire.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#include <Preferences.h>
+#include <math.h>
+#include "MAX30105.h"
+#include "heartRate.h"
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
+const char* WIFI_SSID = "YOUR_WIFI_NAME";
+const char* WIFI_PASS = "YOUR_WIFI_PASSWORD";
+const char* AP_SSID   = "SmartRest_AP";
+const char* AP_PASS   = "12345678";
+
+const int SDA_PIN = 8;
+const int SCL_PIN = 9;
+const long FINGER_THRESHOLD = 40000;
+const byte LED_BRIGHTNESS   = 0x1F;
+
+const int EXERCISE_MARGIN = 15;
+const int RECOVER_MARGIN  = 10;
+const int DROP_BPM        = 10;
+const unsigned long DROP_HOLD_MS = 5000;
+const int RESUME_BPM      = 15;
+const unsigned long FINGER_LOST_MS = 3000;
+
+MAX30105 particleSensor;
+WebServer server(80);
+Preferences prefs;
+
+const uint8_t OLED_ADDR = 0x3C;
+Adafruit_SSD1306 display(128, 64, &Wire, -1);
+bool oledOk = false;
+unsigned long lastOled = 0;
+
+int userAge = 18;
+int hrRest = 74;
+int alertHi = 135;
+int alertLo = 50;
+
+const byte RATE_SIZE = 6;
+float rates[RATE_SIZE];
+byte rateCount = 0, rateSpot = 0;
+unsigned long lastBeat = 0;
+float beatsPerMinute = 0, beatAvg = 0;
+bool fingerOn = false;
+long lastIR = 0;
+
+const int SPO2_BLOCK = 200;
+double sumRed = 0, sumRed2 = 0, sumIr = 0, sumIr2 = 0;
+int blockN = 0;
+const byte SPO2_HIST = 5;
+float spo2Hist[SPO2_HIST];
+byte spo2Count = 0, spo2Spot = 0;
+float spo2Avg = 0;
+
+enum RecPhase { PH_IDLE = 0, PH_EXERCISE = 1, PH_RECOVERY = 2, PH_DONE = 3 };
+RecPhase phase = PH_IDLE;
+int peakHR = 0;
+int minHR = 0;
+unsigned long peakTime = 0;
+unsigned long dropSince = 0;
+unsigned long recoveryStartTime = 0;
+int recoverySec = 0;
+int lastRecSec = 0;
+
+const int BUF_MAX = 64;
+long sampleBuf[BUF_MAX];
+int sampleCount = 0;
+
+void resetBeat() {
+  rateCount = 0; rateSpot = 0; lastBeat = 0;
+  beatsPerMinute = 0; beatAvg = 0;
+}
+
+void resetSpo2() {
+  sumRed = sumRed2 = sumIr = sumIr2 = 0;
+  blockN = 0;
+  spo2Count = 0; spo2Spot = 0; spo2Avg = 0;
+}
+
+void resetRecovery() {
+  phase = PH_IDLE;
+  peakHR = 0; minHR = 0;
+  peakTime = 0; dropSince = 0; recoveryStartTime = 0;
+  recoverySec = 0;
+}
+
+int recoveryElapsed() {
+  if (phase == PH_RECOVERY) return (int)((millis() - recoveryStartTime) / 1000);
+  if (phase == PH_DONE) return recoverySec;
+  return 0;
+}
+
+void updatePhase(unsigned long now, int hr) {
+  switch (phase) {
+    case PH_IDLE:
+      if (hr > hrRest + EXERCISE_MARGIN) {
+        phase = PH_EXERCISE; peakHR = hr; peakTime = now; dropSince = 0;
+      }
+      break;
+
+    case PH_EXERCISE:
+      if (hr >= peakHR) {
+        peakHR = hr; peakTime = now; dropSince = 0;
+      } else if (hr <= peakHR - DROP_BPM) {
+        if (dropSince == 0) {
+          dropSince = now;
+        } else if (now - dropSince >= DROP_HOLD_MS) {
+          phase = PH_RECOVERY;
+          recoveryStartTime = peakTime;
+          minHR = hr;
+        }
+      } else {
+        dropSince = 0;
+      }
+      break;
+
+    case PH_RECOVERY:
+      if (hr < minHR) minHR = hr;
+      if (hr <= hrRest + RECOVER_MARGIN) {
+        phase = PH_DONE;
+        recoverySec = (int)((now - recoveryStartTime) / 1000);
+        lastRecSec = recoverySec;
+      } else if (hr >= minHR + RESUME_BPM) {
+        phase = PH_EXERCISE; peakHR = hr; peakTime = now; dropSince = 0;
+      }
+      break;
+
+    case PH_DONE:
+      if (hr > hrRest + EXERCISE_MARGIN) {
+        phase = PH_EXERCISE; peakHR = hr; peakTime = now; dropSince = 0; recoverySec = 0;
+      }
+      break;
+  }
+}
+
+void loadSettings() {
+  prefs.begin("smartrest", true);
+  userAge = prefs.getInt("age", 18);
+  hrRest  = prefs.getInt("hrRest", 74);
+  alertHi = prefs.getInt("hi", 135);
+  alertLo = prefs.getInt("lo", 50);
+  prefs.end();
+}
+
+void saveSettings() {
+  prefs.begin("smartrest", false);
+  prefs.putInt("age", userAge);
+  prefs.putInt("hrRest", hrRest);
+  prefs.putInt("hi", alertHi);
+  prefs.putInt("lo", alertLo);
+  prefs.end();
+}
+
+const char PAGE[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html lang="th" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Smart Rest - Recovery Planner</title>
+<style>
+  :root { --bg:#111; --card:#1c1c1e; --fg:#eee; --mut:#999; --line:#ff4d5a; --bpm:#ff4d5a;
+          --spo2:#4da3ff; --ok:#34c759; --grid:#333; --btn:#2c2c2e; color-scheme: dark; }
+  :root[data-theme="light"] { --bg:#f2f2f7; --card:#fff; --fg:#111; --mut:#666; --line:#e0303d;
+          --bpm:#d8222f; --spo2:#1a73e8; --ok:#28a745; --grid:#ddd; --btn:#e5e5ea; color-scheme: light; }
+  * { box-sizing: border-box; }
+  body { margin:0; font-family: system-ui, sans-serif; background:var(--bg); color:var(--fg);
+         display:flex; flex-direction:column; align-items:center; padding:16px; }
+  .wrap { width:100%; max-width:640px; }
+  header { display:flex; justify-content:space-between; align-items:center; margin-bottom:12px; }
+  h1 { font-size:20px; font-weight:700; margin:0; color:var(--bpm); }
+  h3 { margin-top:0; }
+  button { font:inherit; color:var(--fg); background:var(--btn); border:0; border-radius:10px;
+           padding:10px 16px; cursor:pointer; font-weight: 600; }
+  button.primary { background:var(--bpm); color:#fff; }
+  button.ok { background:var(--ok); color:#fff; width:100%; margin-top: 10px; }
+  .tabs { display:flex; gap:8px; margin-bottom:12px; }
+  .tabs button { flex:1; }
+  .tabs button.on { background:var(--fg); color:var(--bg); }
+  .card { background:var(--card); border-radius:16px; padding:16px; margin-bottom:12px; }
+  .row { display:flex; justify-content:space-around; text-align:center; align-items:flex-end; }
+  .big { font-size:46px; font-weight:700; line-height:1; }
+  .small { font-size:30px; font-weight:600; line-height:1; }
+  .lab { font-size:12px; color:var(--mut); margin-top:6px; }
+  #bpm { color:var(--bpm); }
+  #bpm.warn { color:#ff9f0a; animation:blink 1s infinite; }
+  @keyframes blink { 50% { opacity:.35; } }
+  #spo2 { color:var(--spo2); }
+  .alert { display:none; text-align:center; font-weight:600; padding:10px; border-radius:10px;
+           margin-top:14px; color:#fff; }
+  .alert.hi { background:#e0303d; }
+  .alert.ok { background:#28a745; }
+  canvas { width:100%; height:180px; display:block; }
+  .grid { display:grid; grid-template-columns:repeat(3,1fr); gap:12px; text-align:center; }
+  .grid .v { font-size:26px; font-weight:700; }
+  .field { display:flex; justify-content:space-between; align-items:center; padding:10px 0;
+           border-bottom:1px solid var(--grid); gap:10px; }
+  .field:last-child { border-bottom:0; }
+  input[type=number], input[type=text] { width:90px; font:inherit; padding:8px; border-radius:8px; text-align:center;
+           border:1px solid var(--grid); background:var(--bg); color:var(--fg); }
+  .btns { display:flex; gap:8px; margin-top:12px; }
+  .btns button { flex:1; }
+  .tab { display:none; }
+  .hint { font-size:12px; color:var(--mut); margin-top:10px; }
+  .credit { text-align:center; font-size:11px; color:var(--mut); opacity:.7; margin:18px 0 4px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>Smart Rest</h1>
+    <button id="themeBtn">🌙</button>
+  </header>
+
+  <div class="tabs">
+    <button data-tab="t1" class="on">ภาพรวมพักฟื้น</button>
+    <button data-tab="t2">สถิติ</button>
+    <button data-tab="t3">ตั้งค่า Baseline</button>
+  </div>
+
+  <div id="t1" class="tab" style="display:block">
+    <div class="card">
+      <div class="row">
+        <div><div class="big" id="bpm">--</div><div class="lab">BPM (เฉลี่ย)</div></div>
+        <div><div class="big" id="spo2">--</div><div class="lab">SpO2 (%)</div></div>
+        <div><div class="small" id="recTime">0:00</div><div class="lab">เวลาพักฟื้น</div></div>
+      </div>
+      <div class="alert" id="alert"></div>
+      <div id="status" style="text-align:center; font-size:14px; margin-top:14px; color:var(--mut);">กำลังเชื่อมต่อ...</div>
+    </div>
+    <div class="card">
+      <div style="text-align:center; font-weight:600; margin-bottom:8px;" id="readyScore">ความพร้อมเข้าเรียน: --</div>
+      <canvas id="c"></canvas>
+      <div class="lab" style="text-align:center">กราฟสัญญาณคลื่นหัวใจแบบเรียลไทม์</div>
+    </div>
+  </div>
+
+  <div id="t2" class="tab">
+    <div class="card">
+      <div class="grid">
+        <div><div class="v" id="smin">--</div><div class="lab">BPM ต่ำสุด</div></div>
+        <div><div class="v" id="savg">--</div><div class="lab">BPM เฉลี่ย</div></div>
+        <div><div class="v" id="smax">--</div><div class="lab">BPM สูงสุด</div></div>
+        <div><div class="v" id="oavg" style="color:var(--spo2)">--</div><div class="lab">SpO2 เฉลี่ย</div></div>
+        <div><div class="v" id="recSec">--</div><div class="lab">เวลาพักฟื้นล่าสุด (วิ)</div></div>
+        <div><div class="v" id="dur">0:00</div><div class="lab">ระยะเวลารวม</div></div>
+      </div>
+    </div>
+    <div class="card">
+      <canvas id="h"></canvas>
+      <div class="lab" style="text-align:center">กราฟ BPM ย้อนหลัง (เส้นประเขียว = เกณฑ์พักฟื้น HRrest+10)</div>
+    </div>
+    <div class="btns">
+      <button class="primary" id="csvBtn">โหลดไฟล์ CSV (Pilot Log)</button>
+      <button id="clearBtn">เริ่มรอบใหม่</button>
+    </div>
+  </div>
+
+  <div id="t3" class="tab">
+    <div class="card">
+      <h3>ตั้งค่าข้อมูล Baseline ส่วนตัว</h3>
+      <div class="field"><span>รหัสผู้ทดลอง (ใช้ในไฟล์ CSV):</span><input type="text" id="inCode" value="A" maxlength="8"></div>
+      <div class="field"><span>อายุ (ปี):</span><input type="number" id="inAge" value="18"></div>
+      <div class="field"><span>ชีพจรขณะพัก HRrest (BPM):</span><input type="number" id="inHrRest" value="74"></div>
+      <div class="field"><span>แจ้งเตือนเมื่อ BPM สูงกว่า:</span><input type="number" id="inHi" value="135"></div>
+      <div class="field"><span>แจ้งเตือนเมื่อ BPM ต่ำกว่า:</span><input type="number" id="inLo" value="50"></div>
+      <button class="ok" id="saveBtn">บันทึกค่าลงอุปกรณ์</button>
+      <div id="saveStatus" style="text-align:center; font-size:12px; margin-top:8px;"></div>
+      <div class="hint">ช่วงที่รับได้: HRrest 40-120, ค่าสูงต้องมากกว่า HRrest+20 (สูงสุด 220), ค่าต่ำ 30-100 และต้องน้อยกว่า HRrest ค่าจะถูกจำไว้แม้ปิดเครื่อง</div>
+    </div>
+  </div>
+
+  <div class="credit">Smart Rest - นวัตกรรมเตือนลิมิตชีพจรและวางแผนพักฟื้นอัตโนมัติ</div>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+let tab = 't1', finger = false;
+const N = 500; let wave = [];
+let rec = [], lastRec = 0;
+let cfg = { hr0: 74, hi: 135, lo: 50 };
+let last = { rt: 0, lr: 0, ph: 0 };
+let cfgLoaded = false;
+const PHASES = ['กำลังวัด', 'กำลังออกกำลังกาย', 'กำลังพักฟื้น', 'พักฟื้นสมบูรณ์'];
+const PHASE_CSV = ['idle', 'exercise', 'recovery', 'recovered'];
+
+function getCode() { try { return localStorage.getItem('sr_code') || 'A'; } catch (e) { return 'A'; } }
+$('inCode').value = getCode();
+$('inCode').onchange = () => {
+  const v = ($('inCode').value.trim() || 'A');
+  try { localStorage.setItem('sr_code', v); } catch (e) { console.log(e); }
+};
+
+let isDark = true;
+$('themeBtn').onclick = () => {
+  isDark = !isDark;
+  document.documentElement.dataset.theme = isDark ? 'dark' : 'light';
+  $('themeBtn').textContent = isDark ? '🌙' : '☀️';
+  render();
+};
+
+document.querySelectorAll('.tabs button').forEach(b => {
+  b.onclick = () => {
+    tab = b.dataset.tab;
+    document.querySelectorAll('.tabs button').forEach(x => x.classList.toggle('on', x === b));
+    document.querySelectorAll('.tab').forEach(s => s.style.display = s.id === tab ? 'block' : 'none');
+    render();
+  };
+});
+
+$('saveBtn').onclick = async () => {
+  const q = new URLSearchParams({
+    age: $('inAge').value, hrRest: $('inHrRest').value, hi: $('inHi').value, lo: $('inLo').value
+  });
+  const st = $('saveStatus');
+  try {
+    const res = await fetch('/set?' + q.toString());
+    if (res.ok) {
+      st.style.color = 'var(--ok)'; st.textContent = '✓ บันทึกข้อมูลสำเร็จ';
+      cfgLoaded = false;
+    } else {
+      st.style.color = '#ff9f0a'; st.textContent = '⚠ ค่าอยู่นอกช่วงที่รับได้ ดูช่วงด้านล่าง';
+    }
+  } catch (e) {
+    console.log(e);
+    st.style.color = '#ff9f0a'; st.textContent = '⚠ เชื่อมต่ออุปกรณ์ไม่ได้';
+  }
+  setTimeout(() => st.textContent = '', 4000);
+};
+
+function prep(c) {
+  const d = window.devicePixelRatio || 1, w = c.clientWidth, h = c.clientHeight;
+  if (!w) return null;
+  if (c.width !== Math.round(w * d)) { c.width = Math.round(w * d); c.height = Math.round(h * d); }
+  const x = c.getContext('2d');
+  x.setTransform(d, 0, 0, d, 0, 0);
+  x.clearRect(0, 0, w, h);
+  return { x, w, h };
+}
+
+function drawWave() {
+  const p = prep($('c')); if (!p || wave.length < 2) return;
+  const { x, w, h } = p;
+  let mn = Math.min(...wave), mx = Math.max(...wave);
+  if (mx - mn < 50) mx = mn + 50;
+  const pad = (mx - mn) * 0.1; mn -= pad; mx += pad;
+  x.beginPath();
+  wave.forEach((v, i) => {
+    const px = i / (N - 1) * w, py = h - (v - mn) / (mx - mn) * h;
+    i ? x.lineTo(px, py) : x.moveTo(px, py);
+  });
+  x.strokeStyle = finger ? '#ff4d5a' : '#888';
+  x.lineWidth = 2; x.stroke();
+}
+
+function drawHist() {
+  const p = prep($('h')); if (!p || rec.length < 2) return;
+  const { x, w, h } = p;
+  const v = rec.map(r => r.a);
+  const target = cfg.hr0 + 10;
+  const mn = Math.min(...v, target) - 5, mx = Math.max(...v, target) + 5;
+  const Y = b => h - (b - mn) / (mx - mn) * h;
+  x.setLineDash([6, 4]); x.lineWidth = 1; x.strokeStyle = '#34c759';
+  x.beginPath(); x.moveTo(0, Y(target)); x.lineTo(w, Y(target)); x.stroke();
+  x.setLineDash([]); x.lineWidth = 2; x.strokeStyle = '#ff4d5a';
+  x.beginPath();
+  v.forEach((b, i) => {
+    const px = i / (v.length - 1) * w;
+    i ? x.lineTo(px, Y(b)) : x.moveTo(px, Y(b));
+  });
+  x.stroke();
+}
+
+function mmss(s) { s = Math.max(0, Math.round(s)); return Math.floor(s / 60) + ':' + String(s % 60).padStart(2, '0'); }
+
+function updateStats() {
+  if (!rec.length) return;
+  const v = rec.map(r => r.a);
+  const sp = rec.filter(r => r.s > 0).map(r => r.s);
+  const sum = a => a.reduce((s, b) => s + b, 0);
+  $('smin').textContent = Math.round(Math.min(...v));
+  $('smax').textContent = Math.round(Math.max(...v));
+  $('savg').textContent = Math.round(sum(v) / v.length);
+  $('oavg').textContent = sp.length ? Math.round(sum(sp) / sp.length) : '--';
+  $('recSec').textContent = last.lr > 0 ? last.lr : '--';
+  $('dur').textContent = mmss((rec[rec.length - 1].t - rec[0].t) / 1000);
+}
+
+function render() {
+  if (tab === 't1') drawWave();
+  if (tab === 't2') { updateStats(); drawHist(); }
+}
+
+function readiness(avg, hr0) {
+  const d = avg - hr0;
+  return d <= 10 ? 5 : d <= 20 ? 4 : d <= 35 ? 3 : d <= 50 ? 2 : 1;
+}
+
+$('csvBtn').onclick = () => {
+  if (!rec.length) return;
+  const code = getCode().replace(/[^A-Za-z0-9_-]/g, '_');
+  const t0 = rec[0].t;
+  let out = 'code,time_s,bpm_avg,spo2,phase,rec_time_s\n';
+  rec.forEach(r => {
+    out += `${code},${Math.round((r.t - t0) / 1000)},${Math.round(r.a)},${r.s > 0 ? r.s.toFixed(1) : ''},${PHASE_CSV[r.ph] || ''},${r.rt}\n`;
+  });
+  const blob = new Blob([out], { type: 'text/csv' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = `SmartRest_${code}.csv`;
+  a.click();
+};
+
+$('clearBtn').onclick = async () => {
+  rec = []; wave = []; lastRec = 0;
+  try { await fetch('/reset'); } catch (e) { console.log(e); }
+  ['smin', 'savg', 'smax', 'oavg', 'recSec'].forEach(id => $(id).textContent = '--');
+  $('dur').textContent = '0:00';
+  $('recTime').textContent = '0:00';
+  render();
+};
+
+async function poll() {
+  let delay = 150;
+  try {
+    const r = await fetch('/data', { cache: 'no-store' });
+    const j = await r.json();
+    last = j;
+    cfg = { hr0: j.hr0, hi: j.hi, lo: j.lo };
+    if (!cfgLoaded) {
+      $('inAge').value = j.age; $('inHrRest').value = j.hr0;
+      $('inHi').value = j.hi; $('inLo').value = j.lo;
+      cfgLoaded = true;
+    }
+    finger = !!j.f;
+    (j.s || []).forEach(v => wave.push(v));
+    while (wave.length > N) wave.shift();
+
+    const avg = (finger && j.avg > 0) ? j.avg : 0;
+    $('bpm').textContent = avg > 0 ? Math.round(avg) : '--';
+    $('bpm').classList.toggle('warn', avg > cfg.hi);
+    $('spo2').textContent = (finger && j.spo2 > 0) ? Math.round(j.spo2) : '--';
+    $('recTime').textContent = mmss(j.rt);
+    $('status').textContent = finger ? ('สถานะ: ' + (PHASES[j.ph] || '')) : 'วางนิ้วบนเซนเซอร์เพื่อเริ่มวัด';
+
+    const a = $('alert');
+    if (avg > cfg.hi) {
+      a.style.display = 'block'; a.className = 'alert hi';
+      a.textContent = '⚠ ชีพจรสูงเกินลิมิต! ควรหยุดพักทันที';
+    } else if (avg > 0 && avg < cfg.lo) {
+      a.style.display = 'block'; a.className = 'alert hi';
+      a.textContent = '⚠ ชีพจรต่ำกว่าที่ตั้งไว้ ตรวจการวางเซนเซอร์ หากรู้สึกผิดปกติให้หยุดพัก';
+    } else if (j.ph === 3) {
+      a.style.display = 'block'; a.className = 'alert ok';
+      a.textContent = '✓ พักฟื้นสมบูรณ์แล้ว! พร้อมเข้าเรียน';
+    } else {
+      a.style.display = 'none';
+    }
+    $('readyScore').textContent = avg > 0
+      ? 'ความพร้อมเข้าเรียน: ' + readiness(avg, cfg.hr0) + '/5'
+      : 'ความพร้อมเข้าเรียน: --';
+
+    const now = Date.now();
+    if (avg > 0 && now - lastRec >= 1000) {
+      lastRec = now;
+      rec.push({ t: now, a: avg, s: j.spo2, ph: j.ph, rt: j.rt });
+    }
+    render();
+  } catch (e) {
+    console.log(e);
+    $('status').textContent = '⚠ ขาดการเชื่อมต่ออุปกรณ์ กำลังลองใหม่...';
+    delay = 1000;
+  }
+  setTimeout(poll, delay);
+}
+
+poll();
+</script>
+</body>
+</html>
+)rawliteral";
+
+void handleRoot() {
+  server.send_P(200, "text/html; charset=utf-8", PAGE);
+}
+
+void handleSettings() {
+  if (!(server.hasArg("age") && server.hasArg("hrRest") && server.hasArg("hi") && server.hasArg("lo"))) {
+    server.send(400, "text/plain", "missing");
+    return;
+  }
+  int age = server.arg("age").toInt();
+  int hr  = server.arg("hrRest").toInt();
+  int hi  = server.arg("hi").toInt();
+  int lo  = server.arg("lo").toInt();
+
+  bool ok = age >= 10 && age <= 100
+         && hr >= 40 && hr <= 120
+         && hi > hr + 20 && hi <= 220
+         && lo >= 30 && lo <= 100 && lo < hr;
+  if (!ok) {
+    server.send(400, "text/plain", "invalid");
+    return;
+  }
+  userAge = age; hrRest = hr; alertHi = hi; alertLo = lo;
+  saveSettings();
+  server.send(200, "text/plain", "OK");
+}
+
+void handleReset() {
+  resetBeat();
+  resetSpo2();
+  resetRecovery();
+  lastRecSec = 0;
+  server.send(200, "text/plain", "OK");
+}
+
+void handleData() {
+  String json;
+  json.reserve(900);
+  json = "{\"f\":";
+  json += fingerOn ? 1 : 0;
+  json += ",\"bpm\":";
+  json += String(beatsPerMinute, 0);
+  json += ",\"avg\":";
+  json += String(rateCount >= 3 ? beatAvg : 0, 0);
+  json += ",\"spo2\":";
+  json += String(spo2Count >= 2 ? spo2Avg : 0, 1);
+  json += ",\"rt\":";
+  json += recoveryElapsed();
+  json += ",\"lr\":";
+  json += lastRecSec;
+  json += ",\"ph\":";
+  json += (int)phase;
+  json += ",\"hr0\":";
+  json += hrRest;
+  json += ",\"hi\":";
+  json += alertHi;
+  json += ",\"lo\":";
+  json += alertLo;
+  json += ",\"age\":";
+  json += userAge;
+  json += ",\"s\":[";
+  for (int i = 0; i < sampleCount; i++) {
+    if (i) json += ",";
+    json += sampleBuf[i];
+  }
+  json += "]}";
+  sampleCount = 0;
+  server.sendHeader("Cache-Control", "no-store");
+  server.send(200, "application/json", json);
+}
+
+void startWiFi() {
+  WiFi.mode(WIFI_STA);
+  WiFi.setTxPower(WIFI_POWER_8_5dBm);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  unsigned long t0 = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - t0 < 15000) {
+    delay(500);
+  }
+  if (WiFi.status() != WL_CONNECTED) {
+    WiFi.mode(WIFI_AP);
+    WiFi.setTxPower(WIFI_POWER_8_5dBm);
+    WiFi.softAP(AP_SSID, AP_PASS);
+  }
+}
+
+void addSpo2Sample(long red, long ir) {
+  sumRed += red;  sumRed2 += (double)red * red;
+  sumIr  += ir;   sumIr2  += (double)ir * ir;
+  if (++blockN < SPO2_BLOCK) return;
+
+  double mr = sumRed / blockN, mi = sumIr / blockN;
+  double vr = sumRed2 / blockN - mr * mr;
+  double vi = sumIr2 / blockN - mi * mi;
+  if (vr < 0) vr = 0;
+  if (vi < 0) vi = 0;
+  double acR = sqrt(vr), acI = sqrt(vi);
+
+  sumRed = sumRed2 = sumIr = sumIr2 = 0;
+  blockN = 0;
+
+  if (mr <= 0 || mi <= 0 || acR <= 0 || acI <= 0) return;
+  double R = (acR / mr) / (acI / mi);
+  if (R < 0.2 || R > 1.5) return;
+
+  double s = -45.060 * (R * R) + 30.354 * R + 94.845;
+  if (s > 100) s = 100;
+  if (s < 70) return;
+
+  spo2Hist[spo2Spot++] = (float)s;
+  spo2Spot %= SPO2_HIST;
+  if (spo2Count < SPO2_HIST) spo2Count++;
+  float sum = 0;
+  for (byte i = 0; i < spo2Count; i++) sum += spo2Hist[i];
+  spo2Avg = sum / spo2Count;
+}
+
+void handleSample(long red, long ir) {
+  static unsigned long lostSince = 0;
+
+  lastIR = ir;
+  if (sampleCount >= BUF_MAX) {
+    memmove(sampleBuf, sampleBuf + 1, (BUF_MAX - 1) * sizeof(long));
+    sampleCount = BUF_MAX - 1;
+  }
+  sampleBuf[sampleCount++] = ir;
+
+  if (ir < FINGER_THRESHOLD) {
+    if (fingerOn) {
+      if (lostSince == 0) lostSince = millis();
+      if (millis() - lostSince > FINGER_LOST_MS) {
+        fingerOn = false;
+        lostSince = 0;
+        resetBeat(); resetSpo2(); resetRecovery();
+      }
+    }
+    return;
+  }
+  lostSince = 0;
+  fingerOn = true;
+
+  addSpo2Sample(red, ir);
+
+  if (checkForBeat(ir)) {
+    unsigned long now = millis();
+    if (lastBeat != 0) {
+      float bpm = 60000.0 / (now - lastBeat);
+      bool inRange = bpm >= 45 && bpm <= 180;
+      bool consistent = (rateCount < 3) || fabs(bpm - beatAvg) < 25;
+      if (inRange && consistent) {
+        beatsPerMinute = bpm;
+        rates[rateSpot++] = bpm;
+        rateSpot %= RATE_SIZE;
+        if (rateCount < RATE_SIZE) rateCount++;
+        float sum = 0;
+        for (byte i = 0; i < rateCount; i++) sum += rates[i];
+        beatAvg = sum / rateCount;
+
+        if (rateCount >= 3) updatePhase(now, (int)(beatAvg + 0.5));
+      }
+    }
+    lastBeat = now;
+  }
+}
+
+void updateOled() {
+  if (!oledOk) return;
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+  display.setTextSize(1);
+  display.setCursor(0, 0);
+  display.print("Smart Rest - Recovery");
+
+  if (!fingerOn) {
+    display.setCursor(0, 20);
+    display.print("Place Finger...");
+    IPAddress ip = (WiFi.getMode() == WIFI_AP) ? WiFi.softAPIP() : WiFi.localIP();
+    display.setCursor(0, 40);
+    display.print(ip.toString());
+  } else {
+    display.setTextSize(2);
+    display.setCursor(0, 16);
+    int hr = 0;
+    if (rateCount >= 3) {
+      hr = (int)(beatAvg + 0.5);
+      display.print(hr);
+      display.print(" BPM");
+    } else {
+      display.print("-- BPM");
+    }
+
+    display.setTextSize(1);
+    display.setCursor(0, 42);
+    if (phase == PH_DONE) {
+      display.print("RECOVERED ");
+      display.print(recoverySec);
+      display.print("s");
+    } else if (phase == PH_RECOVERY) {
+      display.print("Recovering ");
+      display.print(recoveryElapsed());
+      display.print("s");
+    } else if (phase == PH_EXERCISE) {
+      display.print("Exercise");
+    } else {
+      display.print("Measuring");
+    }
+
+    if (hr > alertHi) {
+      display.setCursor(0, 54);
+      display.print("!! REST NOW !!");
+    }
+  }
+  display.display();
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+  Wire.begin(SDA_PIN, SCL_PIN);
+
+  oledOk = display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR);
+  if (oledOk) {
+    display.clearDisplay();
+    display.setTextColor(SSD1306_WHITE);
+    display.setTextSize(1);
+    display.setCursor(0, 0);
+    display.print("Starting...");
+    display.display();
+  }
+
+  if (!particleSensor.begin(Wire, I2C_SPEED_STANDARD)) {
+    Serial.println("MAX30102 not found. Check wiring.");
+    if (oledOk) {
+      display.clearDisplay();
+      display.setCursor(0, 0);
+      display.print("Sensor not found!");
+      display.setCursor(0, 16);
+      display.print("Check wiring");
+      display.display();
+    }
+    while (1) delay(1000);
+  }
+  particleSensor.setup(LED_BRIGHTNESS, 4, 2, 400, 411, 4096);
+
+  loadSettings();
+  startWiFi();
+
+  server.on("/", handleRoot);
+  server.on("/data", handleData);
+  server.on("/set", handleSettings);
+  server.on("/reset", handleReset);
+  server.begin();
+}
+
+void loop() {
+  server.handleClient();
+  particleSensor.check();
+  while (particleSensor.available()) {
+    long red = particleSensor.getFIFORed();
+    long ir  = particleSensor.getFIFOIR();
+    particleSensor.nextSample();
+    handleSample(red, ir);
+  }
+
+  if (millis() - lastOled >= 500) {
+    lastOled = millis();
+    updateOled();
+  }
+  delay(5);
+}
